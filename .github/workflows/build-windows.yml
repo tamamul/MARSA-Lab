@@ -1,0 +1,53 @@
+
+name: Build MARSA-Lab Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Ambil kode sumber
+        uses: actions/checkout@v4
+
+      - name: Pasang .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build Admin
+        run: dotnet publish .\src\MarsaLab.Admin\MarsaLab.Admin.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o .\dist\admin
+
+      - name: Build Desktop
+        run: dotnet publish .\src\MarsaLab.Desktop\MarsaLab.Desktop.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o .\dist\desktop
+
+      - name: Build Client
+        run: dotnet publish .\src\MarsaLab.Client\MarsaLab.Client.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o .\dist\client
+
+      - name: Paketkan hasil build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path .\dist\admin\* -DestinationPath .\MarsaLab-Admin.zip
+          Compress-Archive -Path .\dist\desktop\* -DestinationPath .\MarsaLab-Desktop.zip
+          Compress-Archive -Path .\dist\client\* -DestinationPath .\MarsaLab-Client.zip
+
+      - name: Simpan hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MARSA-Lab-Windows
+          path: |
+            MarsaLab-Admin.zip
+            MarsaLab-Desktop.zip
+            MarsaLab-Client.zip
+          retention-days: 14
