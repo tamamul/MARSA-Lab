@@ -1,0 +1,100 @@
+using System.Diagnostics;
+using System.Net.Http.Json;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+
+var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+if (!File.Exists(configPath)) { Console.WriteLine($"Konfigurasi tidak ditemukan: {configPath}"); return; }
+var config = JsonSerializer.Deserialize<ClientConfig>(File.ReadAllText(configPath), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+if (config is null || string.IsNullOrWhiteSpace(config.ServerUrl) || string.IsNullOrWhiteSpace(config.Token) || config.Token == "GANTI_TOKEN_LAB_INI") { Console.WriteLine("Atur ServerUrl dan Token di appsettings.json."); return; }
+var clientId = string.IsNullOrWhiteSpace(config.ClientId) ? Environment.MachineName : config.ClientId.Trim();
+using var http = new HttpClient { BaseAddress = new Uri(config.ServerUrl.TrimEnd('/') + "/"), Timeout = TimeSpan.FromSeconds(5) };
+http.DefaultRequestHeaders.Add("X-Marsa-Token", config.Token);
+var delay = Math.Clamp(config.HeartbeatSeconds, 3, 30);
+Console.WriteLine($"MARSA Lab Client: {Environment.MachineName} ({clientId})"); Console.WriteLine($"Server: {config.ServerUrl}");
+Console.WriteLine("Kontrol yang didukung: pengumuman, kunci layar, restart/shutdown dengan jeda 60 detik.");
+Console.WriteLine("Jalankan di sesi pengguna Windows agar fitur kunci layar dan pesan tampil.");
+using var stop = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
+while (!stop.IsCancellationRequested)
+{
+    try
+    {
+        using var heartbeat = await http.PostAsJsonAsync("api/heartbeat", new HeartbeatRequest(clientId, Environment.MachineName), stop.Token);
+        if (!heartbeat.IsSuccessStatusCode) Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Heartbeat ditolak: {(int)heartbeat.StatusCode}");
+        using var response = await http.GetAsync($"api/commands/next?clientId={Uri.EscapeDataString(clientId)}", stop.Token);
+        if (response.IsSuccessStatusCode)
+        {
+            var list = await response.Content.ReadFromJsonAsync<List<LabCommand>>(cancellationToken: stop.Token) ?? [];
+            foreach (var command in list) await ExecuteCommand(command, http, clientId, stop.Token);
+        }
+    }
+    catch (OperationCanceledException) when (stop.IsCancellationRequested) { break; }
+    catch (Exception ex) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Server belum terjangkau: {ex.Message}"); }
+    try { await Task.Delay(TimeSpan.FromSeconds(delay), stop.Token); } catch (OperationCanceledException) { break; }
+}
+
+static async Task ExecuteCommand(LabCommand command, HttpClient http, string clientId, CancellationToken ct)
+{
+    var success = false; string result;
+    try
+    {
+        switch (command.Type)
+        {
+            case "announce":
+                if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Fitur ini hanya untuk Windows.");
+                var title = "MARSA Lab - Pengumuman";
+                var safeMessage = command.Message.Replace("\r", " ").Replace("\n", " ");
+                // Windows built-in msg.exe displays a visible message to the signed-in user/session.
+                var msg = RunProcess("msg.exe", $"* /time:60 {Quote($"{title}: {safeMessage}")}");
+                if (msg.ExitCode != 0) throw new InvalidOperationException(msg.Output);
+                result = "Pengumuman ditampilkan."; success = true; break;
+            case "lock":
+                if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Fitur ini hanya untuk Windows.");
+                if (!TryLockWorkStation()) throw new InvalidOperationException("Windows gagal mengirim perintah kunci layar. Pastikan client berjalan pada sesi pengguna aktif.");
+                result = "Perintah kunci layar dikirim."; success = true; break;
+            case "restart":
+            case "shutdown":
+                if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Fitur ini hanya untuk Windows.");
+                var action = command.Type == "restart" ? "/r" : "/s";
+                var note = string.IsNullOrWhiteSpace(command.Message) ? "Perintah admin MARSA Lab" : command.Message.Replace("\r", " ").Replace("\n", " ");
+                var shut = RunProcess("shutdown.exe", $"{action} /t 60 /c {Quote(note)}");
+                if (shut.ExitCode != 0) throw new InvalidOperationException(shut.Output);
+                result = "Dijadwalkan 60 detik lagi; pengguna mendapat peringatan Windows."; success = true; break;
+            case "cancel-shutdown":
+                if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Fitur ini hanya untuk Windows.");
+                var cancel = RunProcess("shutdown.exe", "/a");
+                if (cancel.ExitCode != 0) throw new InvalidOperationException(cancel.Output);
+                result = "Shutdown/restart terjadwal dibatalkan."; success = true; break;
+            case "open-share":
+   		 if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Fitur ini hanya untuk Windows.");
+		    var shareUrl = new Uri(http.BaseAddress!, "siswa.html").ToString();
+ 		   Process.Start(new ProcessStartInfo(shareUrl) { UseShellExecute = true });
+		    result = "Halaman tugas dibuka di browser."; success = true; break;    
+            default: throw new InvalidOperationException("Perintah tidak diizinkan.");
+        }
+    }
+    catch (Exception ex) { result = ex.Message; }
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {command.Type}: {(success ? "OK" : "GAGAL")} - {result}");
+    try { using var ack = await http.PostAsJsonAsync($"api/commands/{command.Id}/result", new CommandResultRequest(clientId, success, result), ct); }
+    catch (Exception ex) { Console.WriteLine($"Gagal mengirim hasil perintah: {ex.Message}"); }
+}
+static (int ExitCode, string Output) RunProcess(string file, string args)
+{
+    using var p = new Process { StartInfo = new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true } };
+    p.Start(); var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd(); p.WaitForExit(10000); return (p.HasExited ? p.ExitCode : -1, output.Trim());
+}
+static string Quote(string s) => "\"" + s.Replace("\"", "'") + "\"";
+static bool TryLockWorkStation()
+{
+    try
+    {
+        using var p = Process.Start(new ProcessStartInfo("rundll32.exe", "user32.dll,LockWorkStation") { UseShellExecute = false, CreateNoWindow = true });
+        return p is not null;
+    }
+    catch { return false; }
+}
+record ClientConfig(string ServerUrl, string Token, string ClientId, int HeartbeatSeconds);
+record HeartbeatRequest(string ClientId, string ComputerName);
+record LabCommand(string Id, string ClientId, string Type, string Message, DateTimeOffset CreatedUtc, string Status, string Result);
+record CommandResultRequest(string ClientId, bool Success, string Result);
