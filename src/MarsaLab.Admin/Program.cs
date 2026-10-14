@@ -83,7 +83,6 @@ var allowed = new[] { "announce", "lock", "restart", "shutdown", "cancel-shutdow
     if (type == "announce" && string.IsNullOrWhiteSpace(message)) return Results.BadRequest(new { error = "Isi pengumuman wajib diisi." });
     if (message.Length > 300) return Results.BadRequest(new { error = "Pesan maksimal 300 karakter." });
     var now = DateTimeOffset.UtcNow;
-    var target = string.IsNullOrWhiteSpace(request.TargetClientId) ? "*" : request.TargetClientId.Trim();
 var target = string.IsNullOrWhiteSpace(request.TargetClientId) ? "*" : request.TargetClientId.Trim();
 var picked = request.TargetClientIds?.Where(i => !string.IsNullOrWhiteSpace(i)).Select(i => i.Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
 var targets = clients.Values.Where(c => now - c.LastSeenUtc <= TimeSpan.FromSeconds(offlineAfterSeconds)
